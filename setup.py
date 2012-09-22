@@ -11,7 +11,7 @@
 # FOR A PARTICULAR PURPOSE.
 #
 ##############################################################################
-name, version = 'zc.zk', '0.5.2-znanja1-znanja1'
+name, version = 'zc.zk', '0.5.2-znanja1'
 
 install_requires = ['setuptools', 'zc.thread']
 extras_require = dict(
