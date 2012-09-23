@@ -11,18 +11,20 @@
 # FOR A PARTICULAR PURPOSE.
 #
 ##############################################################################
-name, version = 'zc.zk', '0.5.2-znanja1-znanja1'
+name, version = 'zc.zk', '0.9.4-znanja1'
 
 install_requires = ['setuptools', 'zc.thread']
 extras_require = dict(
-    test=['zope.testing', 'zc-zookeeper-static', 'mock', 'manuel',
-          'zope.event'],
+    test=['zope.testing >= 4.1.0', 'zc-zookeeper-static', 'mock', 'manuel',
+          'zope.event', 'netifaces', 'zope.component', 'zc.monitor'],
     static=['zc-zookeeper-static'],
     )
 
 entry_points = """
 [console_scripts]
 zookeeper_export = zc.zk.scripts:export
+zookeeper_import = zc.zk.scripts:import_
+zookeeper_validate = zc.zk.scripts:validate_
 """
 
 from setuptools import setup
@@ -43,7 +45,7 @@ setup(
     install_requires = install_requires,
     zip_safe = False,
     entry_points=entry_points,
-    package_data = {name: ['*.txt', '*.test', '*.html']},
+    include_package_data = True,
     extras_require = extras_require,
     tests_require = extras_require['test'],
     test_suite = name+'.tests.test_suite',

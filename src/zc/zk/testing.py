@@ -19,6 +19,8 @@ It's especially useful for testing packages that build on zc.zk.
 It provides setUp and tearDown functions that can be used with
 doctests or with regular ```unittest`` tests.
 """
+from zope.testing import setupstack
+import collections
 import json
 import mock
 import os
@@ -34,6 +36,9 @@ import zookeeper
 
 __all__ = ['assert_', 'setUp', 'tearDown', 'testing_with_real_zookeeper']
 
+def side_effect(mock):
+    return lambda func: setattr(mock, 'side_effect', func)
+
 def assert_(cond, mess='', error=True):
     """A simple assertion function.
 
@@ -47,10 +52,10 @@ def assert_(cond, mess='', error=True):
             print('assertion failed: ', mess)
 
 def wait_until(func=None, timeout=9):
-    """Wait until a function returns true.
+    import warnings
+    warnings.warn("wait_until is deprecated. Use zope.testing.wait.wait",
+                  DeprecationWarning, 2)
 
-    Raise an AssertionError on timeout.
-    """
     if func():
         return
     deadline = time.time()+timeout
@@ -59,7 +64,8 @@ def wait_until(func=None, timeout=9):
         if time.time() > deadline:
             raise AssertionError('timeout')
 
-def setup_tree(tree, connection_string, root='/test-root'):
+def setup_tree(tree, connection_string, root='/test-root',
+               zookeeper_node=False):
     zk = zc.zk.ZooKeeper(connection_string)
     if zk.exists(root):
         zk.delete_recursive(root)
@@ -71,6 +77,13 @@ def setup_tree(tree, connection_string, root='/test-root'):
       threads = 1
       favorite_color = 'red'
     """, root)
+
+    if zookeeper_node:
+        zk.import_tree("""
+        /zookeeper
+          /quota
+        """, root)
+
     zk.close()
 
 def testing_with_real_zookeeper():
@@ -119,27 +132,26 @@ def setUp(test, tree=None, connection_string='zookeeper.example.com:2181'):
     A regular unit test can check the ZooKeeper test attribute.
     """
 
-    globs = getattr(test, 'globs', test.__dict__)
-    teardowns = []
+    globs = setupstack.globs(test)
     faux_zookeeper = None
     real_zk = testing_with_real_zookeeper()
     if real_zk:
         test_root = '/zc.zk.testing.test-root%s' % random.randint(0, sys.maxsize)
         globs['/zc.zk.testing.test-root'] = test_root
-        setup_tree(tree, real_zk, test_root)
+        setup_tree(tree, real_zk, test_root, True)
 
         orig_init = zookeeper.init
-        cm = mock.patch('zookeeper.init')
-        m = cm.__enter__()
+
+        @side_effect(
+            setupstack.context_manager(test, mock.patch('zookeeper.init')))
         def init(addr, watch=None, session_timeout=1000):
             if addr != connection_string:
                 return orig_init(addr, watch, session_timeout)
             else:
                 return orig_init(real_zk+test_root, watch, session_timeout)
-        m.side_effect = init
-        teardowns.append(cm.__exit__)
 
-        teardowns.append(lambda : setattr(zc.zk.ZooKeeper, 'test_sleep', 0))
+        setupstack.register(
+            test, lambda : setattr(zc.zk.ZooKeeper, 'test_sleep', 0))
         zc.zk.ZooKeeper.test_sleep = .01
         time.sleep(float(os.environ.get('TEST_ZOOKEEPER_SLEEP', 0)))
 
@@ -164,18 +176,15 @@ def setUp(test, tree=None, connection_string='zookeeper.example.com:2181'):
         for name in ZooKeeper.__dict__:
             if name[0] == '_':
                 continue
-            cm = mock.patch('zookeeper.'+name)
-            m = cm.__enter__()
+            m = setupstack.context_manager(test, mock.patch('zookeeper.'+name))
             m.side_effect = getattr(faux_zookeeper, name)
-            teardowns.append(cm.__exit__)
 
         if tree:
             zk = zc.zk.ZooKeeper(connection_string)
             zk.import_tree(tree)
             zk.close()
 
-    globs['wait_until'] = wait_until
-    globs['zc.zk.testing'] = teardowns
+    globs['wait_until'] = wait_until # BBB
     globs['ZooKeeper'] = faux_zookeeper
     globs.setdefault('assert_', assert_)
 
@@ -184,13 +193,11 @@ def tearDown(test):
 
     The single argument is the test case passed to setUp.
     """
-    globs = getattr(test, 'globs', test.__dict__)
-    for cm in globs['zc.zk.testing']:
-        cm()
+    setupstack.tearDown(test)
     real_zk = testing_with_real_zookeeper()
     if real_zk:
         zk = zc.zk.ZooKeeper(real_zk)
-        root = globs['/zc.zk.testing.test-root']
+        root = setupstack.globs(test)['/zc.zk.testing.test-root']
         if zk.exists(root):
             zk.delete_recursive(root)
         zk.close()
@@ -215,14 +222,14 @@ class Session:
         self.newstate(zookeeper.CONNECTING_STATE)
 
     def expire(self):
-        self.zk._clear_session(
-            self, zookeeper.SESSION_EVENT, zookeeper.EXPIRED_SESSION_STATE)
+        self.zk._clear_session(self)
         self.newstate(zookeeper.EXPIRED_SESSION_STATE)
 
     def newstate(self, state):
         self.state = state
         if self.watch is not None:
             self.watch(self.handle, zookeeper.SESSION_EVENT, state, '')
+        self.zk._session_event(self.handle, state)
 
     def check(self):
         if self.state == zookeeper.CONNECTING_STATE:
@@ -269,6 +276,8 @@ class ZooKeeper:
         self.sessions = {}
         self.lock = threading.RLock()
         self.failed = {}
+        self.sequence_number = 0
+        self.exists_watchers = collections.defaultdict(tuple)
 
     def init(self, addr, watch=None, session_timeout=4000):
         with self.lock:
@@ -299,6 +308,52 @@ class ZooKeeper:
         return session
 
     def _traverse(self, path):
+        """This is used by a bunch of the methods.
+
+        We'll test som edge cases here.
+
+        We error on bad paths:
+
+        >>> zk = zc.zk.ZK('zookeeper.example.com:2181')
+
+        >>> zk.exists('')
+        Traceback (most recent call last):
+        ...
+        BadArgumentsException: bad argument
+        >>> zk.exists('xxx')
+        Traceback (most recent call last):
+        ...
+        BadArgumentsException: bad argument
+        >>> zk.exists('..')
+        Traceback (most recent call last):
+        ...
+        BadArgumentsException: bad argument
+        >>> zk.exists('.')
+        Traceback (most recent call last):
+        ...
+        BadArgumentsException: bad argument
+
+        >>> zk.get('')
+        Traceback (most recent call last):
+        ...
+        BadArgumentsException: bad argument
+        >>> zk.get('xxx')
+        Traceback (most recent call last):
+        ...
+        BadArgumentsException: bad argument
+        >>> zk.get('..')
+        Traceback (most recent call last):
+        ...
+        BadArgumentsException: bad argument
+        >>> zk.get('.')
+        Traceback (most recent call last):
+        ...
+        BadArgumentsException: bad argument
+
+
+        """
+        if badpath(path):
+            raise zookeeper.BadArgumentsException('bad argument')
         node = self.root
         for name in path.split('/')[1:]:
             if not name:
@@ -310,11 +365,41 @@ class ZooKeeper:
 
         return node
 
-    def _clear_session(self, session, event=None, state=None):
+    def _session_event(self, handle, state):
         with self.lock:
-            self.root.clear_watchers(session.handle, event, state)
+            for path, watchers in list(self.exists_watchers.items()):
+                for h, w in watchers:
+                    if h == handle:
+                        w(h, zookeeper.SESSION_EVENT, state, '')
+            self.root.session_event(handle, state)
+
+
+    def _clear_session(self, session):
+        """
+        Test: don't sweat ephemeral nodes that were already deleted
+
+        >>> zk = zc.zk.ZK('zookeeper.example.com:2181')
+        >>> zk.register_server('/fooservice/providers', 'a:b')
+
+        >>> zk2 = zc.zk.ZK('zookeeper.example.com:2181')
+        >>> zk2.delete_recursive('/fooservice', force=True)
+        >>> zk2.close()
+
+        >>> zk.close()
+        """
+        handle = session.handle
+        with self.lock:
+            self.root.clear_watchers(handle)
+            for path in self.exists_watchers:
+                self.exists_watchers[path] = tuple(
+                    (h, w) for (h, w) in self.exists_watchers[path]
+                    if h != handle
+                    )
             for path in list(session.nodes):
-                self._delete(session.handle, path)
+                try:
+                    self._delete(session.handle, path, clear=True)
+                except zookeeper.NoNodeException:
+                    pass # deleted in another session, perhaps
 
     def _doasync(self, completion, handle, nreturn, func, *args):
         if completion is None:
@@ -350,7 +435,7 @@ class ZooKeeper:
     def close(self, handle):
         with self.lock:
             self._clear_session(self._check_handle(handle, False))
-            del self.sessions[handle]
+            self.sessions.pop(handle).disconnect()
 
     def state(self, handle):
         with self.lock:
@@ -360,15 +445,26 @@ class ZooKeeper:
         with self.lock:
             self._check_handle(handle)
             base, name = path.rsplit('/', 1)
+            if flags & zookeeper.SEQUENCE:
+                self.sequence_number += 1
+                name += "%.10d" % self.sequence_number
+                path = base + '/' + name
             if base.endswith('/'):
                 raise zookeeper.BadArgumentsException('bad arguments')
-            node = self._traverse(base)
+            node = self._traverse(base or '/')
+            for p in node.acl:
+                if not (p['perms'] & zookeeper.PERM_CREATE):
+                    raise zookeeper.NoAuthException('not authenticated')
             if name in node.children:
                 raise zookeeper.NodeExistsException()
             node.children[name] = newnode = Node(data)
             newnode.acl = acl
             newnode.flags = flags
             node.children_changed(handle, zookeeper.CONNECTED_STATE, base)
+
+            for h, w in self.exists_watchers.pop(path, ()):
+                w(h, zookeeper.CREATED_EVENT, zookeeper.CONNECTED_STATE, path)
+
             if flags & zookeeper.EPHEMERAL:
                 self.sessions[handle].add(path)
             return path
@@ -377,14 +473,18 @@ class ZooKeeper:
         return self._doasync(completion, handle, 1,
                             self.create, handle, path, data, acl, flags)
 
-    def _delete(self, handle, path, version=-1):
+    def _delete(self, handle, path, version=-1, clear=False):
         node = self._traverse(path)
         if version != -1 and node.version != version:
             raise zookeeper.BadVersionException('bad version')
         if node.children:
             raise zookeeper.NotEmptyException('not empty')
         base, name = path.rsplit('/', 1)
-        bnode = self._traverse(base)
+        bnode = self._traverse(base or '/')
+        if not clear:
+            for p in bnode.acl:
+                if not (p['perms'] & zookeeper.PERM_DELETE):
+                    raise zookeeper.NoAuthException('not authenticated', path)
         del bnode.children[name]
         node.deleted(handle, zookeeper.CONNECTED_STATE, path)
         bnode.children_changed(handle, zookeeper.CONNECTED_STATE, base)
@@ -402,17 +502,52 @@ class ZooKeeper:
                              self.delete, handle, path, version)
 
     def exists(self, handle, path, watch=None):
-        if watch is not None:
-            raise TypeError('exists watch not supported')
-        if badpath(path):
-            raise zookeeper.BadArgumentsException('bad argument')
+        """Test whether a node exists:
+
+        >>> zk = zc.zk.ZK('zookeeper.example.com:2181')
+        >>> zk.exists('/test_exists')
+
+        We can set watches:
+
+        >>> def watch(*args):
+        ...     print args
+
+        >>> zk.exists('/test_exists', watch)
+        >>> _ = zk.create('/test_exists', '', zc.zk.OPEN_ACL_UNSAFE)
+        (0, 1, 3, '/test_exists')
+
+        When a node exists, exists retirnes it's meta data, which is
+        the same as the second result from get:
+
+        >>> zk.exists('/test_exists') == zk.get('/test_exists')[1]
+        True
+
+        We can set watches on nodes that exist, too:
+
+        >>> zk.exists('/test_exists', watch) == zk.get('/test_exists')[1]
+        True
+
+        >>> _ = zk.delete('/test_exists')
+        (0, 2, 3, '/test_exists')
+
+        Watches are one-time:
+
+        >>> _ = zk.create('/test_exists', '', zc.zk.OPEN_ACL_UNSAFE)
+        >>> _ = zk.delete('/test_exists')
+
+        >>> zk.close()
+        """
         with self.lock:
             self._check_handle(handle)
             try:
-                self._traverse(path)
-                return True
+                node = self._traverse(path)
+                if watch:
+                    node.exists_watchers += ((handle, watch), )
+                return node.meta()
             except zookeeper.NoNodeException:
-                return False
+                if watch:
+                    self.exists_watchers[path] += ((handle, watch), )
+                return None
 
     def aexists(self, handle, path, watch=None, completion=None):
         return self._doasync(completion, handle, 1,
@@ -422,6 +557,9 @@ class ZooKeeper:
         with self.lock:
             self._check_handle(handle)
             node = self._traverse(path)
+            for p in node.acl:
+                if not (p['perms'] & zookeeper.PERM_READ):
+                    raise zookeeper.NoAuthException('not authenticated')
             if watch:
                 node.child_watchers += ((handle, watch), )
             return list(node.children)
@@ -434,6 +572,9 @@ class ZooKeeper:
         with self.lock:
             self._check_handle(handle)
             node = self._traverse(path)
+            for p in node.acl:
+                if not (p['perms'] & zookeeper.PERM_READ):
+                    raise zookeeper.NoAuthException('not authenticated')
             if watch:
                 node.watchers += ((handle, watch), )
             return node.data, node.meta()
@@ -450,6 +591,9 @@ class ZooKeeper:
         with self.lock:
             self._check_handle(handle)
             node = self._traverse(path)
+            for p in node.acl:
+                if not (p['perms'] & zookeeper.PERM_WRITE):
+                    raise zookeeper.NoAuthException('not authenticated')
             if version != -1 and node.version != version:
                 raise zookeeper.BadVersionException('bad version')
             node.data = data
@@ -458,6 +602,10 @@ class ZooKeeper:
                 return node.meta()
             else:
                 return 0
+
+    def set_watcher(self, handle, watch):
+        with self.lock:
+            self._check_handle(handle).watch = watch
 
     def aset(self, handle, path, data, version=-1, completion=None):
         return self._doasync(completion, handle, 1,
@@ -477,6 +625,9 @@ class ZooKeeper:
         with self.lock:
             self._check_handle(handle)
             node = self._traverse(path)
+            for p in node.acl:
+                if not (p['perms'] & zookeeper.PERM_ADMIN):
+                    raise zookeeper.NoAuthException('not authenticated', path)
             if aversion != node.aversion:
                 raise zookeeper.BadVersionException("bad version")
             node.aversion += 1
@@ -489,7 +640,7 @@ class ZooKeeper:
                              self.set_acl, handle, path, aversion, acl)
 
 class Node:
-    watchers = child_watchers = ()
+    watchers = child_watchers = exists_watchers = ()
     flags = 0
     version = aversion = cversion = 0
     acl = zc.zk.OPEN_ACL_UNSAFE
@@ -531,20 +682,29 @@ class Node:
         self.watchers = ()
         for h, w in watchers:
             w(h, zookeeper.DELETED_EVENT, state, path)
+        watchers = self.exists_watchers
+        self.exists_watchers = ()
+        for h, w in watchers:
+            w(h, zookeeper.DELETED_EVENT, state, path)
         watchers = self.child_watchers
         self.watchers = ()
         for h, w in watchers:
             w(h, zookeeper.DELETED_EVENT, state, path)
 
-    def clear_watchers(self, handle, event, state, path='/'):
-        if state is not None:
-            for (h, w) in self.watchers:
-                if h == handle:
-                    w(h, event, state, path)
-            for (h, w) in self.child_watchers:
-                if h == handle:
-                    w(h, event, state, path)
+    def session_event(self, handle, state):
+        for (h, w) in self.watchers:
+            if h == handle:
+                w(h, zookeeper.SESSION_EVENT, state, '')
+        for (h, w) in self.child_watchers:
+            if h == handle:
+                w(h, zookeeper.SESSION_EVENT, state, '')
+        for (h, w) in self.exists_watchers:
+            if h == handle:
+                w(h, zookeeper.SESSION_EVENT, state, '')
+        for child in list(self.children.values()):
+            child.session_event(handle, state)
 
+    def clear_watchers(self, handle):
         self.watchers = tuple(
             (h, w) for (h, w) in self.watchers
             if h != handle
@@ -553,5 +713,9 @@ class Node:
             (h, w) for (h, w) in self.child_watchers
             if h != handle
             )
+        self.exists_watchers = tuple(
+            (h, w) for (h, w) in self.exists_watchers
+            if h != handle
+            )
         for name, child in list(self.children.items()):
-            child.clear_watchers(handle, event, state, path + '/' + name)
+            child.clear_watchers(handle)

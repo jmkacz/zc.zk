@@ -16,6 +16,9 @@ src/zc/zk/disconnectiontests.py
 src/zc/zk/ephemeral_node_recovery_on_session_reestablishment.test
 src/zc/zk/event.py
 src/zc/zk/graphvis.py
+src/zc/zk/monitor.py
+src/zc/zk/monitor.test
+src/zc/zk/monitor.zcml
 src/zc/zk/scripts.py
 src/zc/zk/testing.py
 src/zc/zk/tests.py

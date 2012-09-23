@@ -19,16 +19,17 @@
 # enough to control).
 
 from pprint import pprint
+from zope.testing.wait import wait
 import zc.zk
 import zookeeper
 import zope.testing.loggingsupport
 
 def wait_for_zookeeper():
     """
-    Normally, zc.zk.ZooKeeper raises an exception if it can't connect to
-    ZooKeeper in a second.  Some applications might want to wait, so
-    zc.zk.ZooKeeper accepts a wait parameter that causes it to wait for a
-    connection.
+    Normally, zc.zk.ZooKeeper raises an exception if it can't connect
+    to ZooKeeper in a short time [#initial_connection_wait]_.  Some
+    applications might want to wait, so zc.zk.ZooKeeper accepts a wait
+    parameter that causes it to wait for a connection.
 
     >>> zk = None
     >>> import zc.thread
@@ -42,10 +43,10 @@ def wait_for_zookeeper():
 
     We'll wait a while while it tries in vane to connect:
 
-    >>> wait_until((lambda : zk is not None), 4)
+    >>> wait((lambda : zk is not None), 4)
     Traceback (most recent call last):
     ...
-    AssertionError: timeout
+    TimeOutWaitingFor: <lambda>
 
     >>> print handler # doctest: +ELLIPSIS
     zc.zk CRITICAL
@@ -58,7 +59,7 @@ def wait_for_zookeeper():
     Now, we'll make the connection possible:
 
     >>> ZooKeeper._allow_connection('Invalid')
-    >>> wait_until(lambda : zk is not None)
+    >>> wait(lambda : zk is not None)
 
     >>> zk.state == zookeeper.CONNECTED_STATE
     True
@@ -66,9 +67,12 @@ def wait_for_zookeeper():
     Yay!
 
     >>> zk.close()
+
+    .. [#initial_connection_wait] The initial wait is configurable,
+       mainly for testing, via zc.zk.ZooKeeper.initial_connection_wait
     """
 
-def settion_timeout_with_child_and_data_watchers():
+def session_timeout_with_child_and_data_watchers():
     """
 
 Set up a session with some watchers:
@@ -124,11 +128,57 @@ Now, if we make changes, they'll be properly reflected:
     ['providers', 'x']
 
     >>> print handler
-    zc.zk WARNING
-      Node watcher event -1 with non-connected state, -112
-    zc.zk WARNING
-      Node watcher event -1 with non-connected state, -112
     zc.zk INFO
       connected 0
 
+    """
+
+def session_events_are_ignored_by_child_and_data_watch_support():
+    """Session events are send to child, data and exists watcher.
+
+    This should have no impact on the watch support.
+
+    Nothing should get logged. No errors, no warnings.
+
+    >>> zk = zc.zk.ZooKeeper('zookeeper.example.com:2181')
+    >>> handler = zope.testing.loggingsupport.InstalledHandler('zc.zk')
+    >>> @zk.properties('/fooservice')
+    ... def p(data):
+    ...     print 'property changed'
+    property changed
+
+    >>> @zk.children('/fooservice')
+    ... def c(data):
+    ...     print 'children changed'
+    children changed
+
+    >>> node = ZooKeeper._traverse('/fooservice')
+    >>> len(node.watchers), len(node.child_watchers)
+    (1, 1)
+
+    >>> for state in (zookeeper.CONNECTING_STATE,
+    ...               zookeeper.CONNECTED_STATE,
+    ...               zookeeper.EXPIRED_SESSION_STATE,
+    ...     ):
+    ...     for h, w in (node.watchers + node.child_watchers):
+    ...         w(h, zookeeper.SESSION_EVENT, state, '')
+
+    >>> print handler,
+    >>> handler.uninstall()
+
+    >>> len(node.watchers), len(node.child_watchers)
+    (1, 1)
+
+    >>> zk2 = zc.zk.ZooKeeper('zookeeper.example.com:2181')
+    >>> p2 = zk2.properties('/fooservice')
+    >>> p2.update(z=1)
+    property changed
+    >>> _ = zk2.create('/fooservice/xxx', '', zc.zk.OPEN_ACL_UNSAFE)
+    children changed
+
+    >>> len(node.watchers), len(node.child_watchers)
+    (2, 1)
+
+    >>> zk.close()
+    >>> zk2.close()
     """

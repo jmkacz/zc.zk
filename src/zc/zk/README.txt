@@ -413,7 +413,9 @@ delete_recursive::
           address = u'1.2.3.4:80'
           providers -> /cms/providers
 
-You can't delete nodes ephemeral nodes, or nodes that contain them::
+
+Bt default, ``delete_recursive`` won't delete ephemeral nodes, or
+nodes that contain them::
 
     >>> zk.delete_recursive('/fooservice')
     Not deleting /fooservice/providers/192.168.0.42:8080 because it's ephemeral.
@@ -421,6 +423,9 @@ You can't delete nodes ephemeral nodes, or nodes that contain them::
     Not deleting /fooservice/providers/192.168.0.42:8082 because it's ephemeral.
     /fooservice/providers not deleted due to ephemeral descendent.
     /fooservice not deleted due to ephemeral descendent.
+
+You can use the ``force`` option to force ephemeral nodes to be
+deleted.
 
 Symbolic links
 ==============
@@ -631,7 +636,6 @@ optional property name, separated by whitespace.  If the name is
 ommitted, then the refering name is used.  For example, the name could
 be left off of the property link above.
 
-
 Node deletion
 =============
 
@@ -647,15 +651,13 @@ Registering a server with a blank hostname
 ==========================================
 
 It's common to use an empty string for a host name when calling bind
-to listen on all IPv4 interfaces.  If you pass an empty host name to
-``register_server``, the result of calling ``socket.getfqdn()`` will
-be registered::
-
-    >>> zk.register_server('/fooservice/providers', ('', 42))
-    addresses changed
-    ['192.168.0.42:8080', '192.168.0.42:8081', '192.168.0.42:8082',
-     'server.example.com:42']
-
+to listen on all IPv4 interfaces.  If you pass an address with an
+empty host to ``register_server`` and `netifaces
+<http://alastairs-place.net/projects/netifaces/>`_ is installed, then
+all of the IPv4 addresses [#ifaces]_ (for the given port) will be
+registered.  If netifaces isn't installed and you pass an empty host
+name, then the fully-qualified domain name, as returned by
+``socket.getfqdn()`` will be used for the host.
 
 Server-registration events
 ==========================
@@ -708,8 +710,6 @@ ZooKeeper tree::
           pid = 7981
         /192.168.0.42:8082
           pid = 7981
-        /server.example.com:42
-          pid = 7981
 
 .. -> sh
 
@@ -760,6 +760,143 @@ ZooKeeper tree::
 The export script provides the same features as the ``export_tree``
 method. Use the ``--help`` option to see how to use it.
 
+zookeeper_import script
+=======================
+
+The `zc.zk` package provides a utility script for importing a
+ZooKeeper tree.  So, for example, given the tree::
+
+  /provision
+    /node1
+    /node2
+
+.. -> file_source
+
+    >>> with open('mytree.txt', 'w') as f: f.write(file_source)
+
+In the file ``mytree.txt``, we can import the file like this::
+
+    $ zookeeper_import zookeeper.example.com:2181 mytree.txt /fooservice
+
+.. -> sh
+
+    >>> command = sh.strip()
+    >>> expected = ''
+    >>> _, command, args = command.split(None, 2)
+    >>> import_ = pkg_resources.load_entry_point(
+    ...     'zc.zk', 'console_scripts', command)
+    >>> import_(args.split())
+
+    >>> zk.print_tree()
+    /cms : z4m cms
+      threads = 4
+      /databases
+        main -> /databases/cms
+      /providers
+        /1.2.3.4:5
+          pid = 4102
+    /databases
+      /cms
+        a = 1
+    /fooservice
+      secret = u'1234'
+      threads = 3
+      /providers
+        /192.168.0.42:8080
+          pid = 4102
+        /192.168.0.42:8081
+          pid = 4102
+        /192.168.0.42:8082
+          pid = 4102
+      /provision
+        /node1
+        /node2
+    /lb : ipvs
+      /pools
+        /cms
+          address = u'1.2.3.4:80'
+          providers -> /cms/providers
+
+  Read from stdin:
+
+    >>> stdin = sys.stdin
+    >>> sys.stdin = StringIO.StringIO('/x\n/y')
+    >>> import_('-d zookeeper.example.com:2181 - /fooservice'.split())
+    add /fooservice/x
+    add /fooservice/y
+
+    >>> sys.stdin = StringIO.StringIO('/x\n/y')
+    >>> import_('-d zookeeper.example.com:2181'.split())
+    add /x
+    add /y
+
+  Trim:
+
+    >>> sys.stdin = StringIO.StringIO('/provision\n/y')
+    >>> import_('-dt zookeeper.example.com:2181 - /fooservice'.split())
+    would delete /fooservice/provision/node1.
+    would delete /fooservice/provision/node2.
+    add /fooservice/y
+
+    >>> sys.stdin = stdin
+
+The import script provides the same features as the ``import_tree``
+method, with the exception that it provides less flexibility for
+specifing access control lists. Use the ``--help`` option to see how
+to use it.
+
+Iterating over a tree
+=====================
+
+The ``walk`` method can be used to walk over the nodes in a tree::
+
+    >>> for path in zk.walk():
+    ...     print path
+    /
+    /cms
+    /cms/databases
+    /cms/providers
+    /cms/providers/1.2.3.4:5
+    /databases
+    /databases/cms
+    /fooservice
+    /fooservice/providers
+    /fooservice/providers/192.168.0.42:8080
+    /fooservice/providers/192.168.0.42:8081
+    /fooservice/providers/192.168.0.42:8082
+    /fooservice/provision
+    /fooservice/provision/node1
+    /fooservice/provision/node2
+    /lb
+    /lb/pools
+    /lb/pools/cms
+    /zookeeper
+    /zookeeper/quota
+
+    >>> for path in zk.walk('/fooservice'):
+    ...     print path
+    /fooservice
+    /fooservice/providers
+    /fooservice/providers/192.168.0.42:8080
+    /fooservice/providers/192.168.0.42:8081
+    /fooservice/providers/192.168.0.42:8082
+    /fooservice/provision
+    /fooservice/provision/node1
+    /fooservice/provision/node2
+
+Modifications to nodes are reflected while traversing::
+
+    >>> for path in zk.walk('/fooservice'):
+    ...     print path
+    ...     if 'provision' in zk.get_children(path):
+    ...         zk.delete_recursive(path+'/provision')
+    /fooservice
+    /fooservice/providers
+    /fooservice/providers/192.168.0.42:8080
+    /fooservice/providers/192.168.0.42:8081
+    /fooservice/providers/192.168.0.42:8082
+
+
 Graph analysis
 ==============
 
@@ -785,7 +922,7 @@ Reference
 zc.zk.ZooKeeper
 ---------------
 
-``zc.zk.ZooKeeper([connection_string[, session_timeout[, timeout[, wait]]]])``
+``zc.zk.ZooKeeper([connection_string[, session_timeout[, wait]]])``
     Return a new instance given a ZooKeeper connection string.
 
     The connection string defaults to '127.0.0.1:2181'.
@@ -812,16 +949,29 @@ zc.zk.ZooKeeper
    them up when they are no-longer used.  If you only want to get the
    list of children once, use ``get_children``.
 
+``create_recursive(path, data, acl)``
+   Create a non-ephemeral node at the given path, creating parent
+   nodes if necessary.
+
 ``close()``
     Close the ZooKeeper session.
 
     This should be called when cleanly shutting down servers to more
     quickly remove ephemeral nodes.
 
-``delete_recursive(path[, dry_run])``
+``delete_recursive(path[, dry_run[, force[, ignore_if_ephemeral]]])``
    Delete a node and all of it's sub-nodes.
 
-   Ephemeral nodes or nodes containing them are not deleted.
+   Ephemeral nodes or nodes containing them are not deleted by
+   default. To force deletion of ephemeral nodes, supply the ``force``
+   option with a true value.
+
+   Normally, a message is printed if a node can't be deleted because
+   it's ephemeral or has ephemeral sub-nodes.  If the
+   ``ignore_if_ephemeral`` option is true, the a message isn't printed
+   if the node's path was passed to ``delete_recursive`` directly.
+   (This is used by ``import_tree`` when the only nodes that would be
+   trimmed are ephemeral nodes.)
 
    The dry_run option causes a summary of what would be deleted to be
    printed without actually deleting anything.
@@ -854,11 +1004,14 @@ zc.zk.ZooKeeper
    object.
 
 ``get_properties(path)``
-   Get the properties for the node at the given path as a dictionary.
+   Get the raw properties for the node at the given path as a dictionary.
 
-   This is more efficient than ``properties`` when all you need is to
-   read the properties once, as it doesn't create a
-   `zc.zk.Properties`_ object.
+   This method is mainly for internal use.  Because it doesn't resolve
+   property links, it's of dubious use for applications.
+
+   (It's only included in the documentation because it was included
+    before with a suggestion that it was more efficient than
+    ``properties``, which it is if you just want raw data.)
 
 ``import_tree(text[, path='/'[, trim[, acl[, dry_run]]]])``
     Create tree nodes by importing a textual tree representation.
@@ -880,6 +1033,9 @@ zc.zk.ZooKeeper
     dry_run
        Boolean, defaulting to false, indicating whether to do a dry
        run of the import, without applying any changes.
+
+``is_ephemeral(path)``
+   Return ``True`` if the node at ``path`` is ephemeral,``False`` otherwise.
 
 ``ln(source, destination)``
    Create a symbolic link at the destination path pointing to the
@@ -917,6 +1073,9 @@ zc.zk.ZooKeeper
 
 ``resolve(path)``
    Find the real path for the given path.
+
+``walk(path)``
+   Iterate over the nodes of a tree rooted at path.
 
 In addition, ``ZooKeeper`` instances provide access to the following
 ZooKeeper functions as methods: ``acreate``, ``add_auth``,
@@ -971,6 +1130,33 @@ __getitem__, __len__, etc..
 
     The ``Properties`` instance is returned.
 
+Other module attributes
+------------------------
+
+``zc.zk.ZK``
+   A convenient aliad for ``zc.zk.ZooKeeper`` for people who hate to
+   type.
+
+``zc.zk.OPEN_ACL_UNSAFE``
+   An access control list that grants the world all rights.
+
+``zc.zk.READ_ACL_UNSAFE``
+   An access control list that gives the world read access only.
+
+.. test
+
+    >>> zc.zk.ZK is zc.zk.ZooKeeper
+    True
+
+    >>> import zookeeper
+    >>> zc.zk.OPEN_ACL_UNSAFE == [
+    ...     dict(perms=zookeeper.PERM_ALL, scheme='world', id='anyone')]
+    True
+
+    >>> zc.zk.READ_ACL_UNSAFE == [
+    ...     dict(perms=zookeeper.PERM_READ, scheme='world', id='anyone')]
+    True
+
 Testing support
 ---------------
 
@@ -988,6 +1174,98 @@ more, use the help function::
 
 Change History
 ==============
+
+
+0.9.4 (2012-09-11)
+------------------
+
+- Added entry point to create a script for validating a ZooKeeper tree.
+
+0.9.3 (2012-08-31)
+------------------
+
+- Fixed: The documentation for get_properties was missleading.
+
+- Fixed: Property links were incomplete:
+         Iteration and methods keys, values, and items weren't handled
+         correctly.
+
+- Fixed: When importing a tree with no changes and the trim option,
+         messages were printed for ephemeral nodes.
+
+0.9.2 (2012-08-08)
+------------------
+
+- Fixed: The testing ZooKeeper mock didn't properly error when bad
+  paths were passed to APIs.
+
+0.9.1 (2012-07-10)
+------------------
+
+- Fixed a packaging problem.
+
+0.9.0 (2012-06-25)
+------------------
+
+- Added support for discovering and testing ephemeral addresses using
+  zc.monitor.  See ``monitor.test`` for details.
+
+- Fixed: The ZooKeeper logging bridge sometimes generated lots of
+  spurious empty log messages.
+
+0.8.0 (2012-05-15)
+------------------
+
+- Fixed: ephemeral *sequence* nodes were restablished on session
+  reestablishment and shouldn't have been.
+
+- Fixed: The testing ZooKeeper mock didn't implement sequence nodes
+  correctly.
+
+- Fixed: The testing ZooKeeper mock didn't implement ``exists``
+  correctly.
+
+- Fixed: Session events were misshandled by the high-level children
+  and properties watch-support code in a way that cause scary both
+  otherwise harmless log message.
+
+- Increased the initial time to wait for ZooKeeper connections.
+
+0.7.0 (2012-01-27)
+------------------
+
+- Added ``walk``, ``is_ephemeral``, and ``create_recursive`` methods.
+
+- Fixed testing: Added access-control fidelity to the testing
+  ZooKeeper stub.
+
+- Fixed testing: There were spurious errors when closing a testing
+  ZooKeeper connection in which ephemeral nodes were created and when
+  they were deleted by another session.
+
+- Fixed testing: When running with a real ZooKeeper server, the
+  (virtual) root didn't have a ``zookeeper`` node.
+
+0.6.0 (2012-01-25)
+------------------
+
+- Improved ``register_server`` in the case when an empty host is
+  passed.  If `netifaces
+  <http://alastairs-place.net/projects/netifaces/>`_ is installed,
+  ``register_server`` registers all of the IPv4 addresses [#ifaces]_.
+
+- Added ``zookeeper_import`` shell script for importing ZooKeeper trees.
+
+- ``delete_recursive`` now has a ``force`` argument to force deletion of
+  ephemeral nodes.
+
+- Added ``zc.zk.ZK`` as an alias for ``zc.zk.ZooKeeper``.
+
+- Documented pre-defined access control lists
+  ``zc.zk.OPEN_ACL_UNSAFE`` and ``zc.zk.READ_ACL_UNSAFE``
+
+- Fixed: the ``dry_run`` argument to ``delete_recursive`` didn't work
+  properly.
 
 0.5.2 (2012-01-06)
 ------------------
@@ -1084,3 +1362,15 @@ Initial release
 .. test cleanup
 
    >>> zk.close()
+
+
+----------------------------------------------------------------------
+
+.. [#ifaces] It's a little more complicated.  If there are non-local
+   interfaces, then only non-local addresses are registered.  In
+   normal production, there's really no point in registering local
+   addresses, as clients on other machines can't make any sense of
+   them. If *only* local interfaces are found, then local addresses
+   are registered, under the assumption that someone is developing on
+   a disconnected computer.
+

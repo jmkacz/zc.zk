@@ -42,6 +42,8 @@ def loggingthread():
                   )
     while True:
         line = f.readline().strip()
+        if not line:
+            continue
         try:
             if '@' in line:
                 level, message = line.split('@', 1)
@@ -154,6 +156,8 @@ class Resolving:
 
 class ZooKeeper(Resolving):
 
+    initial_connection_wait = 9.0
+
     def __init__(self, connection_string="127.0.0.1:2181", session_timeout=None,
                  wait=False):
         self.watches = WatchManager()
@@ -195,7 +199,7 @@ class ZooKeeper(Resolving):
             init = lambda : zookeeper.init(connection_string, watch_session)
 
         handle = init()
-        connected.wait(1)
+        connected.wait(self.initial_connection_wait)
         if not connected.is_set():
             if wait:
                 while not connected.is_set():
@@ -207,20 +211,43 @@ class ZooKeeper(Resolving):
                 raise FailedConnect(connection_string)
 
 
+    def _findallipv4addrs(self, tail):
+        try:
+            import netifaces
+        except ImportError:
+            return [socket.getfqdn()+tail]
+
+        addrs = set()
+        loopaddrs = set()
+        for iface in netifaces.interfaces():
+            for info in netifaces.ifaddresses(iface).get(2, ()):
+                addr = info.get('addr')
+                if addr:
+                    if addr.startswith('127.'):
+                        loopaddrs.add(addr+tail)
+                    else:
+                        addrs.add(addr+tail)
+
+        return addrs or loopaddrs
+
     def register_server(self, path, addr, acl=READ_ACL_UNSAFE, **kw):
         kw['pid'] = os.getpid()
-        if isinstance(addr, str):
-            if addr[:1] == ':':
-                addr = socket.getfqdn()+addr
+
+        if not isinstance(addr, str):
+            addr = '%s:%s' % tuple(addr)
+
+        if addr[:1] == ':':
+            addrs = self._findallipv4addrs(addr)
         else:
-            if addr[0] == '':
-                addr = socket.getfqdn(), addr[1]
-            addr = '%s:%s' % addr
+            addrs = (addr,)
+
         path = self.resolve(path)
         zc.zk.event.notify(RegisteringServer(addr, path, kw))
         if path != '/':
             path += '/'
-        self.create(path + addr, encode(kw), acl, zookeeper.EPHEMERAL)
+
+        for addr in addrs:
+            self.create(path + addr, encode(kw), acl, zookeeper.EPHEMERAL)
 
     test_sleep = 0
     def _async(self, completion, meth, *args):
@@ -245,7 +272,7 @@ class ZooKeeper(Resolving):
     acreate = create
 
     def _post_create(self, path, data, acl, flags):
-        if flags & zookeeper.EPHEMERAL:
+        if (flags & zookeeper.EPHEMERAL) and not (flags & zookeeper.SEQUENCE):
             self.ephemeral[path] = dict(data=data, acl=acl, flags=flags)
 
     def delete(self, path, version=-1, completion=None):
@@ -309,6 +336,9 @@ class ZooKeeper(Resolving):
 
         def handler(h, t, state, p, reraise=False):
 
+            if t == zookeeper.SESSION_EVENT:
+                return
+
             if state != zookeeper.CONNECTED_STATE:
                 # This can happen if we get disconnected or a session expires.
                 # When we reconnect, we should restablish the watchers.
@@ -357,6 +387,15 @@ class ZooKeeper(Resolving):
     def children(self, path):
         return Children(self, path)
 
+    def create_recursive(self, path, data, acl):
+        if self.exists(path):
+            return
+        base, name = path.rsplit('/', 1)
+        if base:
+            self.create_recursive(base, data, acl)
+        if not self.exists(path):
+            self.create(path, data, acl)
+
     def get_properties(self, path):
         return decode(self.get(path)[0])
 
@@ -377,7 +416,8 @@ class ZooKeeper(Resolving):
                     continue
                 cpath = join(path, name)
                 if trim:
-                    self.delete_recursive(cpath, dry_run)
+                    self.delete_recursive(cpath, dry_run,
+                                          ignore_if_ephemeral=True)
                 else:
                     print('extra path not trimmed:', cpath)
 
@@ -423,15 +463,26 @@ class ZooKeeper(Resolving):
                     self.create(cpath, data, acl)
             self._import_tree(cpath, child, acl, trim, dry_run)
 
-    def delete_recursive(self, path, dry_run=False):
+    def delete_recursive(self, path, dry_run=False, force=False,
+                         ignore_if_ephemeral=False):
+        self._delete_recursive(path, dry_run, force, ignore_if_ephemeral)
+
+    def _delete_recursive(self, path, dry_run, force,
+                          ignore_if_ephemeral=False):
+        ephemeral_child = None
         for name in sorted(self.get_children(path)):
-            self.delete_recursive(join(path, name))
+            ephemeral_child = (
+                self._delete_recursive(join(path, name), dry_run, force) or
+                ephemeral_child
+                )
 
-        if self.get_children(path):
+        if ephemeral_child:
             print("%s not deleted due to ephemeral descendent." % path)
-            return
+            return ephemeral_child
 
-        ephemeral = self.get(path)[1]['ephemeralOwner']
+        ephemeral = self.is_ephemeral(path) and not force
+        if ephemeral and ignore_if_ephemeral:
+            return
         if dry_run:
             if ephemeral:
                 print("wouldn't delete %s because it's ephemeral." % path)
@@ -443,6 +494,10 @@ class ZooKeeper(Resolving):
             else:
                 logger.info('deleting %s', path)
                 self.delete(path)
+        return ephemeral
+
+    def is_ephemeral(self, path):
+        return bool(self.get(path)[1]['ephemeralOwner'])
 
     def export_tree(self, path='/', ephemeral=False, name=None):
         output = []
@@ -490,7 +545,6 @@ class ZooKeeper(Resolving):
     def _set(self, path, data):
         return self.set(path, data)
 
-
     def ln(self, target, source):
         base, name = source.rsplit('/', 1)
         if target[-1] == '/':
@@ -508,6 +562,15 @@ class ZooKeeper(Resolving):
         if self.handle is None:
             return zookeeper.CONNECTING_STATE
         return zookeeper.state(self.handle)
+
+    def walk(self, path='/'):
+        yield path
+        for name in sorted(self.get_children(path)):
+            if path != '/':
+                name = '/'+name
+            for p in self.walk(path+name):
+                yield p
+
 
 def _make_method(name):
     return (lambda self, *a, **kw:
@@ -597,6 +660,7 @@ class WatchManager:
                 if v is not None:
                     yield v
 
+ZK = ZooKeeper
 
 class NodeInfo:
 
@@ -752,6 +816,12 @@ class Properties(NodeInfo, collections.Mapping):
                     v, 'in %r: %r' %
                     (key + ' =>', self.data[key + ' =>'])
                     )
+
+    def __iter__(self):
+        for key in self.data:
+            if key.endswith(' =>'):
+                key = key[:-3]
+            yield key
 
     def __len__(self):
         return len(self.data)
