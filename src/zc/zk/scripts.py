@@ -95,7 +95,7 @@ def import_(args=None):
         import_file.read(), path,
         trim=options.trim,
         dry_run=options.dry_run,
-        acl=[zc.zk.world_permission(options.permission)],
+		acl=None,
         )
 
 def validate_(args=None):
